@@ -1616,7 +1616,9 @@ mod tests {
         ))
         .unwrap();
 
-        let btf = obj.fixup_and_sanitize_btf(&BtfFeatures::default()).unwrap();
+        let btf = obj
+            .fixup_and_sanitize_btf(&BtfFeatures::default(), &std::collections::HashSet::new())
+            .unwrap();
         assert!(btf.is_none());
     }
 
