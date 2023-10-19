@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto as _,
-    fs::remove_file,
+    fs::{create_dir, remove_dir_all, remove_file},
     path::Path,
     thread,
     time::{Duration, SystemTime},
@@ -13,7 +13,7 @@ use aya::{
         loaded_links, loaded_programs, KProbe, TracePoint, UProbe, Xdp, XdpFlags,
     },
     util::KernelVersion,
-    Bpf,
+    Bpf, BpfLoader,
 };
 use aya_obj::programs::XdpAttachType;
 use test_log::test;
@@ -79,7 +79,7 @@ fn pin_lifecycle_multiple_btf_maps() {
 
     // pin and unpin all maps before casting to explicit types
     for (i, (name, map)) in bpf.maps_mut().enumerate() {
-        // Don't pin system maps or the map that's already pinned by name.
+        // Don't pin system maps.
         if name.contains(".rodata") || name.contains(".bss") {
             continue;
         }
@@ -125,6 +125,83 @@ fn pin_lifecycle_multiple_btf_maps() {
     remove_file(map_1_pin_path).unwrap();
     remove_file(map_2_pin_path).unwrap();
     remove_file(map_pin_by_name_path).unwrap();
+}
+
+#[test]
+fn pin_lifecycle_sharing_btf_maps() {
+    let map_pin_path = Path::new("/sys/fs/bpf/map-sharing-test");
+    if map_pin_path.exists() {
+        remove_dir_all(map_pin_path).unwrap();
+    }
+    create_dir(map_pin_path).unwrap();
+
+    let mut loader = BpfLoader::new();
+
+    let mut bpf = loader.load(crate::MULTIMAP_BTF).unwrap();
+
+    // "map_pin_by_name" should already be pinned at the default bpffs.
+    let map_pin_by_name_path = Path::new("/sys/fs/bpf/map_pin_by_name");
+
+    assert!(map_pin_by_name_path.exists());
+    remove_file(map_pin_by_name_path).unwrap();
+
+    for (_, (name, map)) in bpf.maps_mut().enumerate() {
+        // Don't pin system maps.
+        if name.contains(".rodata") || name.contains(".bss") {
+            continue;
+        }
+
+        // Pin the map by it's name.
+        map.pin(map_pin_path.join(name)).unwrap();
+        assert!(map_pin_path.exists());
+    }
+
+    // Load the same program using the existing maps at map_pin_path.
+    let mut bpf1 = loader
+        .map_pin_path(map_pin_path)
+        .load(crate::MULTIMAP_BTF)
+        .unwrap();
+
+    // Get the maps from the first program.
+    let map_1: Array<_, u64> = bpf.take_map("map_1").unwrap().try_into().unwrap();
+    let map_2: Array<_, u64> = bpf.take_map("map_2").unwrap().try_into().unwrap();
+    let map_pin_by_name: Array<_, u64> =
+        bpf.take_map("map_pin_by_name").unwrap().try_into().unwrap();
+
+    // Attach both programs so they can be triggered.
+    let prog: &mut UProbe = bpf.program_mut("bpf_prog").unwrap().try_into().unwrap();
+    prog.load().unwrap();
+    prog.attach(Some("trigger_bpf_program"), 0, "/proc/self/exe", None)
+        .unwrap();
+
+    let prog1: &mut UProbe = bpf1.program_mut("bpf_prog1").unwrap().try_into().unwrap();
+    prog1.load().unwrap();
+    prog1
+        .attach(Some("trigger_bpf_program"), 0, "/proc/self/exe", None)
+        .unwrap();
+
+    trigger_bpf_program();
+
+    // Ensure both program's updated the same maps.
+    let key = 0;
+    let val_1 = map_1.get(&key, 0).unwrap();
+    let val_2 = map_2.get(&key, 0).unwrap();
+    let val_3 = map_pin_by_name.get(&key, 0).unwrap();
+
+    assert_eq!(val_1, 24);
+    assert_eq!(val_2, 42);
+    assert_eq!(val_3, 44);
+
+    let key = 1;
+    let val_1 = map_1.get(&key, 0).unwrap();
+    let val_2 = map_2.get(&key, 0).unwrap();
+    let val_3 = map_pin_by_name.get(&key, 0).unwrap();
+
+    assert_eq!(val_1, 35);
+    assert_eq!(val_2, 53);
+    assert_eq!(val_3, 55);
+
+    remove_dir_all(map_pin_path).unwrap()
 }
 
 #[no_mangle]
